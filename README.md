@@ -11,8 +11,8 @@ To build it:
    $ yum groupinstall -y "Development Tools"
    ```
 
-2. You'll need a recent version of the pam_tacplus code checked out
-   from GitHub and built:
+2. You'll need a recent version of the [pam_tacplus](https://github.com/jeroennijhof/pam_tacplus)
+   code checked out from GitHub and build:
 
    ```
    $ git clone https://github.com/jeroennijhof/pam_tacplus.git
@@ -20,7 +20,8 @@ To build it:
    $ autoreconf -i && ./configure && make && sudo make install
    ```
 
-3. Acquire the nss_tacplus source, and build the project:
+3. Acquire the [nss_tacplus](https://github.com/benschumacher/nss_tacplus)
+   source, and build the project:
  
    ```
    $ git clone https://github.com/benschumacher/nss_tacplus.git
@@ -28,8 +29,7 @@ To build it:
    $ make
    ```
 
-4. Assuming I didn't forget something about, you should now have a
-   libnss_tacplus.so.2 library:
+4. You should now have a `libnss_tacplus.so.2` library:
  
    ```
    $ ls -l libnss_tacplus.so.2
