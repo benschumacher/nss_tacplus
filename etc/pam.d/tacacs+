@@ -1,0 +1,24 @@
+#%PAM-1.0
+#####################################################################
+## Pam Service Configuration for QNS
+## Author: QPS
+##
+## Requirements
+## ============
+## This configuration file is specific to QNS CentOS distribution
+##
+## Instructions
+## ============
+## 1. Place this file in /etc/pam.d
+##
+######################################################################
+
+auth  [success=2 default=ignore] pam_succeed_if.so uid < 501
+auth  [success=1 default=ignore] pam_succeed_if.so user in root
+auth  [success=done default=ignore]	/usr/local/lib/security/pam_tacplus.so debug server=10.0.0.1 secret=password login=plain timeout=2
+
+account [success=2 default=ignore] pam_succeed_if.so uid < 501
+account [success=1 default=ignore] pam_succeed_if.so user in roots
+account	sufficient /usr/local/lib/security/pam_tacplus.so debug service=linuxlogin protocol=ssh timeout=2
+
+session optional /usr/local/lib/security/pam_tacplus.so debug server=10.0.0.1 secret=password service=linuxlogin protocol=ssh timeout=2
