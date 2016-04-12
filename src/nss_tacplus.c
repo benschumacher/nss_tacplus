@@ -333,7 +333,7 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
     }
 
     fclose(fp);
-    return NSS_STATUS_SUCCESS;
+    return status;
 }
 
 static void _check_config(int cycle)
@@ -671,7 +671,7 @@ enum nss_status _nss_tacplus_getpwnam_r(const char *name, struct passwd *pw,
 
         // connect to the current server
         errno = 0;
-        tac_fd = tac_connect_single(server, G_tacplus_conf.secret, NULL);
+        tac_fd = tac_connect_single(server, G_tacplus_conf.secret, NULL, 15);
 
         if (0 > tac_fd)
         {
