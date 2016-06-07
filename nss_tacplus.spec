@@ -25,7 +25,7 @@ Source0: 1.0.0.tar.gz
 
 # Dependency Information
 BuildRequires: gcc 
-#Requires: 
+Requires: pam_tacplus-devel
 
 %description
 NSS Tacacs+ module based on code produced by Ben Schumacher
