@@ -4,7 +4,7 @@ LIBS=		-lnsl -lpthread -ltac
 TEST_LIBS=	-ldl
 
 CC=	gcc
-CFLAGS=	-D_FORTIFY_SOURCE=2 -fstack-protector -std=gnu99 -Werror -Wall \
+CFLAGS=	-D_FORTIFY_SOURCE=2 -O -fstack-protector -std=gnu99 -Werror -Wall \
 	-ggdb -fPIC -I/usr/local/lib
 LDFLAGS=-shared -Wl,-soname,libnss_tacplus.so.2 -Wl,-rpath=/usr/local/lib
 
