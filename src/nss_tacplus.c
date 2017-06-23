@@ -226,8 +226,8 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
 
                 *srv = '\0';
 
-                if (0 == (rv == getaddrinfo(val, port ? port : "49", &hints,
-                                            &servers)))
+                if (0 == (rv = getaddrinfo(val, port ? port : "49", &hints,
+                                           &servers)))
                 {
                     assert(NULL != servers);
 
