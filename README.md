@@ -68,9 +68,23 @@ Authorization query for a given 'username':
   the numeric user identifier for the TACACS+ authenticated user on the
   host.
 
+  In the /etc/tacplus.conf file, if "default-hashed-uid" is set to "yes",
+  then a default UID will be hashed from the username, and it will be used
+  if no UID is received from the server.  The hashed UID is not guaranteed
+  to be unique, but it should be for most cases.
+
 * `gid`
 
-  The group identifier or the TACACS+ authenticated user on the host.
+  The group identifier of the TACACS+ authenticated user on the host.
+
+  Either `gid` or `group` is needed, but not both.
+
+* `group`
+
+  The group name of the TACACS+ authenticated user on the host.  The group
+  name will be converted to GID on the local system.
+
+  Either `gid` or `group` is needed, but not both.
 
 * `home`
 
@@ -94,6 +108,11 @@ Authorization query for a given 'username':
       This should be used for users in the 'qns-ro' group
       (`gid=505`)
 
+  In the /etc/tacplus.conf file, if "default-home" is set, then it will be
+  used if no HOME is received from the server.  For example, if
+  "default-home" is set to "/home", then the user's home will be
+  /home/<username>
+
 * `shell`
 
   The system-level login shell of the user. This can be any of the
@@ -110,6 +129,9 @@ Authorization query for a given 'username':
 
   The `/usr/bin/sudosh` shell can be used to audit user's activity
   on the system. 
+
+  In the /etc/tacplus.conf file, if "default-shell" is set, then it will be
+  used if no SHELL is received from the server.
 
 ## Using TACACS+ NSS module
 

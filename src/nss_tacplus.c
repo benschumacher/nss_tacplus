@@ -22,6 +22,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <grp.h>
 
 #define TACPLUS_CONF_FILE "/etc/tacplus.conf"
 #define CONFIG_BUFSZ 1024
@@ -30,6 +31,12 @@ static pthread_once_t G_tacplus_initialized = PTHREAD_ONCE_INIT;
 static time_t G_tacplus_started = -1;
 static uint32_t G_tacplus_cycles = 0;
 static char G_tacplus_confbuf[CONFIG_BUFSZ];
+struct tacplus_server_st
+{
+    struct addrinfo *server;
+    char *secret;
+    struct tacplus_server_st *next;
+};
 static struct tacplus_conf_st
 {
     enum nss_status status;
@@ -37,24 +44,54 @@ static struct tacplus_conf_st
 
     time_t mtime;
 
-    struct addrinfo *servers;
-    struct addrinfo *lastsrv;
+    struct tacplus_server_st *servers;
+    struct tacplus_server_st *lastsrv;
 
-    char *secret;
     uint32_t timeout;
     uint8_t debug_level;
     char *service;
     char *protocol;
+    char *default_hashed_uid;
+    char *default_home;
+    char *default_shell;
 } G_tacplus_conf;
 
-static const char CONFKEY_SERVER[]   = "server";
-static const char CONFKEY_SECRET[]   = "secret";
-static const char CONFKEY_TIMEOUT[]  = "timeout";
-static const char CONFKEY_DEBUGLVL[] = "debug-level";
-static const char CONFKEY_SERVICE[]  = "service";
-static const char CONFKEY_PROTOCOL[] = "protocol";
+static const char CONFKEY_SERVER[]    = "server";
+static const char CONFKEY_SECRET[]    = "secret";
+static const char CONFKEY_TIMEOUT[]   = "timeout";
+static const char CONFKEY_DEBUGLVL[]  = "debug-level";
+static const char CONFKEY_SERVICE[]   = "service";
+static const char CONFKEY_PROTOCOL[]  = "protocol";
+static const char CONFKEY_DEF_UID[]   = "default-hashed-uid";
+static const char CONFKEY_DEF_HOME[]  = "default-home";
+static const char CONFKEY_DEF_SHELL[] = "default-shell";
 
 static const char NO_PASSWD[] = "x";
+
+/* https://stackoverflow.com/questions/2351087/what-is-the-best-32bit-hash-function-for-short-strings-tag-names# */
+/* modified to output in the range of 2000 - 2147483647 */
+/* name_hash: compute hash value of string */
+unsigned int name_hash(const char *str)
+{
+   unsigned int h;
+   unsigned char *p;
+   /* Empirically, the values 31 and 37 have proven to be good choices for the
+      multiplier in a hash function for ASCII strings. */
+   unsigned int MULTIPLIER=37;
+
+   h = 0;
+   for (p = (unsigned char*)str; *p != '\0'; p++)
+      h = MULTIPLIER * h + *p;
+
+   /* Enforce high range of 2147483647 */
+   h &= 0x7fffffff;
+   
+   /* Enforce low range of 2000 */
+   if (h < 2000)
+      h += 2000;
+   
+   return h;
+}
 
 /**
  * Safely convert a base-10 string into an unsigned long. This function
@@ -102,11 +139,13 @@ static int8_t _safe_convert_ulong(const char *str, unsigned long *out)
 
 /**
  * Parses the configuration for this module. The format is simple:
- *   server <ip[:port]>[,ip[:port]]...[ip[:port]]
- *   secret <secret>              (used by all servers)
+ *   server <ip[:port]> secret <secret> (can have multiple server lines)
  *   timeout <seconds>            (used by all servers)
  *   service <TACACS+ service>    (defaults to linuxlogin)
  *   protocol <TACACS+ protocol>  (defaults to ssh)
+ *   default-hashed-uid <yes/no>  (defaults to no (UID from TACACS+))
+ *   default-home <home prefix>   (defaults to HOME from TACACS+. Ex: /home)
+ *   default-shell <shell>        (defaults to SHELL from TACACS+. Ex: /bin/sh)
  *   debug-level <int>            (currently unused)
  *
  * \param[in] buffer a buffer than can be used to store string values
@@ -154,7 +193,6 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
     {
         char *key = NULL;
         char *val = NULL;
-        char *endval = NULL;
         size_t len = 0;
 
         // ignore empty lines and comments
@@ -193,82 +231,119 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
             --len;
         }
         val[++len] = '\0';
-        endval = (val + len);
 
         if (0 == strncmp(key, CONFKEY_SERVER, sizeof(CONFKEY_SERVER)))
         {
             int rv = -1;
             char *srv = val;
+            char *secret = NULL;
             struct addrinfo hints;
 
             memset(&hints, 0, sizeof(hints));
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
 
-            while (endval > val)
-            {
-                struct addrinfo *servers = NULL;
-                char *port = NULL;
+            struct addrinfo *server = NULL;
+            char *port = NULL;
 
-                while ('\0' != *srv && ',' != *srv && ':' != *srv)
+            // parse server and optional port
+            while ('\0' != *srv && !isspace(*srv) && ':' != *srv)
+            {
+                ++srv;
+            }
+            if (':' == *srv)
+            {
+                *srv = '\0';
+                port = ++srv;
+                while ('\0' != *srv && !isspace(*srv))
                 {
                     ++srv;
                 }
-                if (':' == *srv)
+            }
+            *srv = '\0';
+
+            // get ready to parse the next part of line (ex: secret)
+            key = ++srv;
+
+            // save server
+            srv = val;
+
+            // reset val to key
+            val = key;
+
+            // find "secret" keyword
+            while ('\0' != *val && !isspace(*val))
+            {
+                ++val;
+            }
+
+            // null terminate keyword
+            *(val++) = '\0';
+
+            // no "secret" keyword or no secret value? log it, but continue
+            if (0 != strncmp(key, CONFKEY_SECRET, sizeof(CONFKEY_SECRET)) ||
+                '\0' == *val)
+            {
+                syslog(LOG_WARNING, "%s: server=`%s' is missing a secret",
+                       __FILE__, srv);
+            }
+            else
+            {
+                // secret keyword and value found
+
+                // move past remaining whitespace
+                while (isspace(*val))
                 {
-                    *srv = '\0';
-                    port = ++srv;
-                    while ('\0' != *srv && ',' != *srv)
-                    {
-                        ++srv;
-                    }
+                    ++val;
                 }
 
-                *srv = '\0';
-
-                if (0 == (rv = getaddrinfo(val, port ? port : "49", &hints,
-                                           &servers)))
+                // rest of line is the secret value
+                if (bufleft < strlen(val) + 1)
                 {
-                    assert(NULL != servers);
-
-                    if (NULL == G_tacplus_conf.lastsrv)
-                    {
-                        assert(NULL == G_tacplus_conf.servers);
-                        G_tacplus_conf.lastsrv =
-                            G_tacplus_conf.servers = servers;
-                    }
-                    else
-                    {
-                        assert(NULL != G_tacplus_conf.servers);
-                        G_tacplus_conf.lastsrv->ai_next = servers;
-                    }
-
-                    // iterate our linked-list to the end
-                    while (NULL != G_tacplus_conf.lastsrv->ai_next)
-                    {
-                        G_tacplus_conf.lastsrv =
-                            G_tacplus_conf.lastsrv->ai_next;
-                    }
+                    errno = ERANGE;
+                    status = NSS_STATUS_TRYAGAIN;
+                    break;
                 }
 
-                val = ++srv;
-            }
-        }
-        else if (0 == strncmp(key, CONFKEY_SECRET, sizeof(CONFKEY_SECRET)))
-        {
-            if (bufleft < strlen(val) + 1)
-            {
-                errno = ERANGE;
-                status = NSS_STATUS_TRYAGAIN;
-                break;
+                secret = offset;
+                while ('\0' != *val)
+                {
+                    *offset++ = *val++;
+                }
+                // null terminate offset
+                *offset = '\0';
+                bufleft = buflen - (++offset - buffer);
             }
 
-            G_tacplus_conf.secret = offset;
-            while ('\0' != *val)
+            if (0 == (rv = getaddrinfo(srv, port ? port : "49", &hints,
+                                       &server)))
             {
-                *offset++ = *val++;
+                assert(NULL != server);
+
+                // allocate new entry
+                struct tacplus_server_st *ts = (struct tacplus_server_st*)
+                    malloc(sizeof(struct tacplus_server_st));
+                ts->server = server;
+                ts->secret = secret;
+                ts->next = NULL;
+
+                if (NULL == G_tacplus_conf.lastsrv)
+                {
+                    assert(NULL == G_tacplus_conf.servers);
+                    G_tacplus_conf.lastsrv = G_tacplus_conf.servers = ts;
+                }
+                else
+                {
+                    assert(NULL != G_tacplus_conf.servers);
+                    G_tacplus_conf.lastsrv->next = ts;
+                }
+
+                // iterate our linked-list to the end
+                while (NULL != G_tacplus_conf.lastsrv->next)
+                {
+                    G_tacplus_conf.lastsrv = G_tacplus_conf.lastsrv->next;
+                }
             }
-            bufleft = buflen - (++offset - buffer);
         }
         else if (0 == strncmp(key, CONFKEY_TIMEOUT, sizeof(CONFKEY_TIMEOUT)))
         {
@@ -319,6 +394,55 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
             }
 
             G_tacplus_conf.protocol = offset;
+            while ('\0' != *val)
+            {
+                *offset++ = *val++;
+            }
+            bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_DEF_UID, sizeof(CONFKEY_DEF_UID)))
+        {
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            G_tacplus_conf.default_hashed_uid = offset;
+            while ('\0' != *val)
+            {
+                *offset++ = *val++;
+            }
+            bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_DEF_HOME, sizeof(CONFKEY_DEF_HOME)))
+        {
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            G_tacplus_conf.default_home = offset;
+            while ('\0' != *val)
+            {
+                *offset++ = *val++;
+            }
+            bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_DEF_SHELL,
+                              sizeof(CONFKEY_DEF_SHELL)))
+        {
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            G_tacplus_conf.default_shell = offset;
             while ('\0' != *val)
             {
                 *offset++ = *val++;
@@ -424,6 +548,7 @@ static const char TAC_ATTR_UID[] = "UID";
 static const char TAC_ATTR_GID[] = "GID";
 static const char TAC_ATTR_HOME[] = "HOME";
 static const char TAC_ATTR_SHELL[] = "SHELL";
+static const char TAC_ATTR_GROUP[] = "GROUP";
 
 static const char *REQUIRED_TAC_ATTRS[] =
     {
@@ -447,6 +572,7 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
     char *offset = buffer;
     const char *attr_good[REQUIRED_TAC_ATTRS_LEN] = { 0 };
     ptrdiff_t bufleft = buflen - (offset - buffer);
+    char *group = NULL;
 
 #define mark_attr_good(attrptr)                          \
     for (size_t i = 0; i < REQUIRED_TAC_ATTRS_LEN; ++i)  \
@@ -563,6 +689,35 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
                 bufleft = buflen - (++offset - buffer);
                 mark_attr_good(TAC_ATTR_SHELL);
             }
+            if (0 == strcmp(tmp, TAC_ATTR_GROUP))
+            {
+                if (bufleft < strlen(value) + 1)
+                {
+                    goto buffer_full;
+                }
+
+                group = offset;
+                while ('\0' != *value)
+                {
+                    *offset++ = *value++;
+                }
+                bufleft = buflen - (++offset - buffer);
+
+                if (bufleft < strlen(value) + 1)
+                // Map group name to gid
+                errno = 0;
+                struct group *grp = getgrnam(group);
+                if (grp)
+                {
+                    pw->pw_gid = grp->gr_gid;
+                    mark_attr_good(TAC_ATTR_GID);
+                }
+                else
+                {
+                    *errnop = errno;
+                    status = NSS_STATUS_TRYAGAIN;
+                }
+            }
         }
         else
         {
@@ -590,9 +745,29 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
 
         if (!seen)
         {
-            syslog(LOG_WARNING, "%s: missing required attribute '%s'",
-                   __FILE__, cur);
-            status = NSS_STATUS_NOTFOUND;
+            if ((0 == strcmp(cur, TAC_ATTR_UID)) &&
+                (0 == strcmp(G_tacplus_conf.default_hashed_uid, "yes")))
+            {
+                pw->pw_uid = name_hash(pw->pw_name);
+            }
+            else if ((0 == strcmp(cur, TAC_ATTR_HOME)) &&
+                     (NULL != G_tacplus_conf.default_home))
+            {
+                char *dir = (char*) malloc(sizeof(char)*80);
+                sprintf(dir, "%s/%s", G_tacplus_conf.default_home, pw->pw_name);
+                pw->pw_dir = dir;
+            }
+            else if ((0 == strcmp(cur, TAC_ATTR_SHELL)) &&
+                     (NULL != G_tacplus_conf.default_shell))
+            {
+                pw->pw_shell = G_tacplus_conf.default_shell;
+            }
+            else
+            {
+                syslog(LOG_WARNING, "%s: missing required attribute '%s'",
+                       __FILE__, cur);
+                status = NSS_STATUS_NOTFOUND;
+            }
         }
     }
 
@@ -612,7 +787,7 @@ enum nss_status _nss_tacplus_getpwnam_r(const char *name, struct passwd *pw,
 {
     enum nss_status status = NSS_STATUS_NOTFOUND;
     int tac_fd = -1;
-    struct addrinfo *server = NULL;
+    struct tacplus_server_st *server = NULL;
     time_t now = -1;
     uint32_t cycle = 0;
 
@@ -650,28 +825,31 @@ enum nss_status _nss_tacplus_getpwnam_r(const char *name, struct passwd *pw,
     // not on server.
     for (server = G_tacplus_conf.servers;
          NSS_STATUS_NOTFOUND == status && NULL != server;
-         server = server->ai_next)
+         server = server->next)
     {
         void *sin_addr = NULL;
 
         // the first member of sockaddr_in and sockaddr_in6 are the same, so
         // this should always work.
-        uint16_t port = ntohs(((struct sockaddr_in *)server->ai_addr)->sin_port);
+        uint16_t port = ntohs(((struct sockaddr_in *)
+                               server->server->ai_addr)->sin_port);
 
         // this is ugly, but we need to differentiate IPv6 vs. IPv4 addresses
         // (in practice, this may not be necessary, as I'm not certain if the
         // remainder of this code is capable of handling IPv6, yet.)
-        sin_addr = (  AF_INET6 == server->ai_family
-                    ? (void*)&((struct sockaddr_in6 *)server->ai_addr)->sin6_addr
-                    : (void*)&((struct sockaddr_in *)server->ai_addr)->sin_addr);
-        inet_ntop(server->ai_family, sin_addr, buffer, buflen);
+        sin_addr = (  AF_INET6 == server->server->ai_family
+                    ? (void*)&((struct sockaddr_in6 *)
+                               server->server->ai_addr)->sin6_addr
+                    : (void*)&((struct sockaddr_in *)
+                               server->server->ai_addr)->sin_addr);
+        inet_ntop(server->server->ai_family, sin_addr, buffer, buflen);
 
         syslog(LOG_INFO, "%s: begin lookup: user=`%s', server=`%s:%d'",
                __FILE__, name, buffer, port);
 
         // connect to the current server
         errno = 0;
-        tac_fd = tac_connect_single(server, G_tacplus_conf.secret, NULL, 15);
+        tac_fd = tac_connect_single(server->server, server->secret, NULL, 15);
 
         if (0 > tac_fd)
         {
