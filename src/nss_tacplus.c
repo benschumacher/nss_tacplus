@@ -791,6 +791,15 @@ enum nss_status _nss_tacplus_getpwnam_r(const char *name, struct passwd *pw,
     time_t now = -1;
     uint32_t cycle = 0;
 
+    // If user is "*" or "%q", exit immediately, as this causes hanging on
+    // the command line with tab completion if any of the tacacs+ servers
+    // are down.  "*" is seen for normal bash tab competion and "%q" is
+    // seen when "~" (home dir shortcut) is part of the tab completion.
+    if ((0 == strcmp(name, "*")) || (0 == strcmp(name, "%q")))
+    {
+        return status;
+    }
+
     (void)pthread_once(&G_tacplus_initialized, &_initalize_tacplus);
     now = time(NULL);
 
