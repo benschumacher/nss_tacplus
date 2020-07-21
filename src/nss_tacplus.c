@@ -25,7 +25,7 @@
 #include <grp.h>
 
 #define TACPLUS_CONF_FILE "/etc/tacplus.conf"
-#define CONFIG_BUFSZ 1024
+#define CONFIG_BUFSZ 4096
 
 static pthread_once_t G_tacplus_initialized = PTHREAD_ONCE_INIT;
 static time_t G_tacplus_started = -1;
@@ -36,6 +36,18 @@ struct tacplus_server_st
     struct addrinfo *server;
     char *secret;
     struct tacplus_server_st *next;
+};
+struct tacplus_group_map_st
+{
+    char *remote_group;
+    char *local_group;
+    struct tacplus_group_map_st *next;
+};
+struct tacplus_shell_map_st
+{
+    char *remote_group;
+    char *shell;
+    struct tacplus_shell_map_st *next;
 };
 static struct tacplus_conf_st
 {
@@ -54,22 +66,29 @@ static struct tacplus_conf_st
     char *default_hashed_uid;
     char *default_home;
     char *default_shell;
+
+    struct tacplus_group_map_st *group_map;
+    struct tacplus_group_map_st *last_group_map;
+    struct tacplus_shell_map_st *shell_map;
+    struct tacplus_shell_map_st *last_shell_map;
 } G_tacplus_conf;
 
-static const char CONFKEY_SERVER[]    = "server";
-static const char CONFKEY_SECRET[]    = "secret";
-static const char CONFKEY_TIMEOUT[]   = "timeout";
-static const char CONFKEY_DEBUGLVL[]  = "debug-level";
-static const char CONFKEY_SERVICE[]   = "service";
-static const char CONFKEY_PROTOCOL[]  = "protocol";
-static const char CONFKEY_DEF_UID[]   = "default-hashed-uid";
-static const char CONFKEY_DEF_HOME[]  = "default-home";
-static const char CONFKEY_DEF_SHELL[] = "default-shell";
+static const char CONFKEY_SERVER[]       = "server";
+static const char CONFKEY_SECRET[]       = "secret";
+static const char CONFKEY_TIMEOUT[]      = "timeout";
+static const char CONFKEY_DEBUGLVL[]     = "debug-level";
+static const char CONFKEY_SERVICE[]      = "service";
+static const char CONFKEY_PROTOCOL[]     = "protocol";
+static const char CONFKEY_DEF_UID[]      = "default-hashed-uid";
+static const char CONFKEY_DEF_HOME[]     = "default-home";
+static const char CONFKEY_DEF_SHELL[]    = "default-shell";
+static const char CONFKEY_MAPPED_GROUP[] = "mapped-group";
+static const char CONFKEY_MAPPED_SHELL[] = "mapped-shell";
 
 static const char NO_PASSWD[] = "x";
 
 /* https://stackoverflow.com/questions/2351087/what-is-the-best-32bit-hash-function-for-short-strings-tag-names# */
-/* modified to output in the range of 2000 - 2147483647 */
+/* modified to output in the range of 10000 - 2147483647 */
 /* name_hash: compute hash value of string */
 unsigned int name_hash(const char *str)
 {
@@ -86,9 +105,9 @@ unsigned int name_hash(const char *str)
    /* Enforce high range of 2147483647 */
    h &= 0x7fffffff;
    
-   /* Enforce low range of 2000 */
-   if (h < 2000)
-      h += 2000;
+   /* Enforce low range of 10000 */
+   if (h < 10000)
+      h += 10000;
    
    return h;
 }
@@ -139,14 +158,16 @@ static int8_t _safe_convert_ulong(const char *str, unsigned long *out)
 
 /**
  * Parses the configuration for this module. The format is simple:
- *   server <ip[:port]> secret <secret> (can have multiple server lines)
- *   timeout <seconds>            (used by all servers)
- *   service <TACACS+ service>    (defaults to linuxlogin)
- *   protocol <TACACS+ protocol>  (defaults to ssh)
- *   default-hashed-uid <yes/no>  (defaults to no (UID from TACACS+))
- *   default-home <home prefix>   (defaults to HOME from TACACS+. Ex: /home)
- *   default-shell <shell>        (defaults to SHELL from TACACS+. Ex: /bin/sh)
- *   debug-level <int>            (currently unused)
+ *   server <ip[:port]> secret <secret>        (can have multiple server lines)
+ *   timeout <seconds>                         (used by all servers)
+ *   service <TACACS+ service>                 (defaults to linuxlogin)
+ *   protocol <TACACS+ protocol>               (defaults to ssh)
+ *   default-hashed-uid <yes/no>               (defaults to no (UID from TACACS+))
+ *   default-home <home prefix>                (defaults to HOME from TACACS+. Ex: /home)
+ *   default-shell <shell>                     (defaults to SHELL from TACACS+. Ex: /bin/sh)
+ *   mapped-group <remote group> <local group> (maps remote to local group)
+ *   mapped-shell <remote group> <shell>       (maps remote group to shell)
+ *   debug-level <int>                         (currently unused)
  *
  * \param[in] buffer a buffer than can be used to store string values
  * \param[in] buflen the length of the `buffer'
@@ -449,6 +470,144 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
             }
             bufleft = buflen - (++offset - buffer);
         }
+        else if (0 == strncmp(key, CONFKEY_MAPPED_GROUP, sizeof(CONFKEY_MAPPED_GROUP)))
+        {
+            char *remote_group = NULL;
+            char *local_group = NULL;
+
+            // parse remote group
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            remote_group = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // move past remaining whitespace
+            while (isspace(*val))
+            {
+                ++val;
+            }
+
+            // parse local group
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            local_group = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // allocate new entry
+            struct tacplus_group_map_st *ts = (struct tacplus_group_map_st*)
+                malloc(sizeof(struct tacplus_group_map_st));
+            ts->remote_group = remote_group;
+            ts->local_group = local_group;
+            ts->next = NULL;
+
+            if (NULL == G_tacplus_conf.last_group_map)
+            {
+                assert(NULL == G_tacplus_conf.group_map);
+                G_tacplus_conf.last_group_map = G_tacplus_conf.group_map = ts;
+            }
+            else
+            {
+                assert(NULL != G_tacplus_conf.group_map);
+                G_tacplus_conf.last_group_map->next = ts;
+            }
+
+            // iterate our linked-list to the end
+            while (NULL != G_tacplus_conf.last_group_map->next)
+            {
+                G_tacplus_conf.last_group_map = G_tacplus_conf.last_group_map->next;
+            }
+        }
+        else if (0 == strncmp(key, CONFKEY_MAPPED_SHELL, sizeof(CONFKEY_MAPPED_SHELL)))
+        {
+            char *remote_group = NULL;
+            char *shell = NULL;
+
+            // parse remote group
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            remote_group = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // move past remaining whitespace
+            while (isspace(*val))
+            {
+                ++val;
+            }
+
+            // parse shell
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            shell = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // allocate new entry
+            struct tacplus_shell_map_st *ts = (struct tacplus_shell_map_st*)
+                malloc(sizeof(struct tacplus_shell_map_st));
+            ts->remote_group = remote_group;
+            ts->shell = shell;
+            ts->next = NULL;
+
+            if (NULL == G_tacplus_conf.last_shell_map)
+            {
+                assert(NULL == G_tacplus_conf.shell_map);
+                G_tacplus_conf.last_shell_map = G_tacplus_conf.shell_map = ts;
+            }
+            else
+            {
+                assert(NULL != G_tacplus_conf.shell_map);
+                G_tacplus_conf.last_shell_map->next = ts;
+            }
+
+            // iterate our linked-list to the end
+            while (NULL != G_tacplus_conf.last_shell_map->next)
+            {
+                G_tacplus_conf.last_shell_map = G_tacplus_conf.last_shell_map->next;
+            }
+        }
         else
         {
             syslog(LOG_WARNING, "%s: unknown configuration key=`%s'",
@@ -573,6 +732,9 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
     const char *attr_good[REQUIRED_TAC_ATTRS_LEN] = { 0 };
     ptrdiff_t bufleft = buflen - (offset - buffer);
     char *group = NULL;
+    char *shell = NULL;
+    struct tacplus_group_map_st *group_map_entry = NULL;
+    struct tacplus_shell_map_st *shell_map_entry = NULL;
 
 #define mark_attr_good(attrptr)                          \
     for (size_t i = 0; i < REQUIRED_TAC_ATTRS_LEN; ++i)  \
@@ -587,6 +749,19 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
             break;                                       \
         }                                                \
     }
+
+#define is_attr_good(attrptr)                            \
+({                                                       \
+    bool is_good = false;                                \
+    for (size_t i = 0; i < REQUIRED_TAC_ATTRS_LEN; ++i)  \
+    {                                                    \
+        if ((attrptr) == attr_good[i])                   \
+        {                                                \
+            is_good = true;                              \
+        }                                                \
+    }                                                    \
+    is_good;                                             \
+})
 
     // nullify the attr_good variable
     memset(attr_good, 0, sizeof(attr_good));
@@ -681,13 +856,18 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
                     goto buffer_full;
                 }
 
-                pw->pw_shell = offset;
+                if (!is_attr_good(TAC_ATTR_SHELL))
+                {
+                    // If shell was not set via a mapped group, process it
+                    pw->pw_shell = offset;
+                    mark_attr_good(TAC_ATTR_SHELL);
+                }
+
                 while ('\0' != *value)
                 {
                     *offset++ = *value++;
                 }
                 bufleft = buflen - (++offset - buffer);
-                mark_attr_good(TAC_ATTR_SHELL);
             }
             if (0 == strcmp(tmp, TAC_ATTR_GROUP))
             {
@@ -703,7 +883,34 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
                 }
                 bufleft = buflen - (++offset - buffer);
 
-                if (bufleft < strlen(value) + 1)
+                // Iterate through our mapped group list
+                for (group_map_entry = G_tacplus_conf.group_map;
+                     NULL != group_map_entry;
+                     group_map_entry = group_map_entry->next)
+                {
+                    if (0 == strcmp(group_map_entry->remote_group, group))
+                    {
+                        // Now find the mapped shell
+                        // Iterate through our mapped shell list
+                        for (shell_map_entry = G_tacplus_conf.shell_map;
+                             NULL != shell_map_entry;
+                             shell_map_entry = shell_map_entry->next)
+                        {
+                            if (0 == strcmp(shell_map_entry->remote_group, group))
+                            {
+                                // Found group in map, substitute mapped group name
+                                shell = shell_map_entry->shell;
+                                break;
+                            }
+                        }
+
+                        // Found group in map, substitute mapped group name
+                        group = group_map_entry->local_group;
+                        syslog(LOG_WARNING, "%s: mapped group: %s, mapped shell: %s", __FILE__, group, shell);
+                        break;
+                    }
+                }
+
                 // Map group name to gid
                 errno = 0;
                 struct group *grp = getgrnam(group);
@@ -711,6 +918,13 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
                 {
                     pw->pw_gid = grp->gr_gid;
                     mark_attr_good(TAC_ATTR_GID);
+
+                    // Now that gid is good, check if a shell was mapped
+                    if (NULL != shell)
+                    {
+                        pw->pw_shell = shell;
+                        mark_attr_good(TAC_ATTR_SHELL);
+                    }
                 }
                 else
                 {
