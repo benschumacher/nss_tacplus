@@ -344,6 +344,7 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
                 // allocate new entry
                 struct tacplus_server_st *ts = (struct tacplus_server_st*)
                     malloc(sizeof(struct tacplus_server_st));
+                assert(NULL != ts);
                 ts->server = server;
                 ts->secret = secret;
                 ts->next = NULL;
@@ -518,6 +519,7 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
             // allocate new entry
             struct tacplus_group_map_st *ts = (struct tacplus_group_map_st*)
                 malloc(sizeof(struct tacplus_group_map_st));
+            assert(NULL != ts);
             ts->remote_group = remote_group;
             ts->local_group = local_group;
             ts->next = NULL;
@@ -587,6 +589,7 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
             // allocate new entry
             struct tacplus_shell_map_st *ts = (struct tacplus_shell_map_st*)
                 malloc(sizeof(struct tacplus_shell_map_st));
+            assert(NULL != ts);
             ts->remote_group = remote_group;
             ts->shell = shell;
             ts->next = NULL;
@@ -968,6 +971,7 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
                      (NULL != G_tacplus_conf.default_home))
             {
                 char *dir = (char*) malloc(sizeof(char)*80);
+                assert(NULL != dir);
                 sprintf(dir, "%s/%s", G_tacplus_conf.default_home, pw->pw_name);
                 pw->pw_dir = dir;
             }
