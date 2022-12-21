@@ -22,14 +22,33 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <grp.h>
 
 #define TACPLUS_CONF_FILE "/etc/tacplus.conf"
-#define CONFIG_BUFSZ 1024
+#define CONFIG_BUFSZ 4096
 
 static pthread_once_t G_tacplus_initialized = PTHREAD_ONCE_INIT;
 static time_t G_tacplus_started = -1;
 static uint32_t G_tacplus_cycles = 0;
 static char G_tacplus_confbuf[CONFIG_BUFSZ];
+struct tacplus_server_st
+{
+    struct addrinfo *server;
+    char *secret;
+    struct tacplus_server_st *next;
+};
+struct tacplus_group_map_st
+{
+    char *remote_group;
+    char *local_group;
+    struct tacplus_group_map_st *next;
+};
+struct tacplus_shell_map_st
+{
+    char *remote_group;
+    char *shell;
+    struct tacplus_shell_map_st *next;
+};
 static struct tacplus_conf_st
 {
     enum nss_status status;
@@ -37,24 +56,61 @@ static struct tacplus_conf_st
 
     time_t mtime;
 
-    struct addrinfo *servers;
-    struct addrinfo *lastsrv;
+    struct tacplus_server_st *servers;
+    struct tacplus_server_st *lastsrv;
 
-    char *secret;
     uint32_t timeout;
     uint8_t debug_level;
     char *service;
     char *protocol;
+    char *default_hashed_uid;
+    char *default_home;
+    char *default_shell;
+
+    struct tacplus_group_map_st *group_map;
+    struct tacplus_group_map_st *last_group_map;
+    struct tacplus_shell_map_st *shell_map;
+    struct tacplus_shell_map_st *last_shell_map;
 } G_tacplus_conf;
 
-static const char CONFKEY_SERVER[]   = "server";
-static const char CONFKEY_SECRET[]   = "secret";
-static const char CONFKEY_TIMEOUT[]  = "timeout";
-static const char CONFKEY_DEBUGLVL[] = "debug-level";
-static const char CONFKEY_SERVICE[]  = "service";
-static const char CONFKEY_PROTOCOL[] = "protocol";
+static const char CONFKEY_SERVER[]       = "server";
+static const char CONFKEY_SECRET[]       = "secret";
+static const char CONFKEY_TIMEOUT[]      = "timeout";
+static const char CONFKEY_DEBUGLVL[]     = "debug-level";
+static const char CONFKEY_SERVICE[]      = "service";
+static const char CONFKEY_PROTOCOL[]     = "protocol";
+static const char CONFKEY_DEF_UID[]      = "default-hashed-uid";
+static const char CONFKEY_DEF_HOME[]     = "default-home";
+static const char CONFKEY_DEF_SHELL[]    = "default-shell";
+static const char CONFKEY_MAPPED_GROUP[] = "mapped-group";
+static const char CONFKEY_MAPPED_SHELL[] = "mapped-shell";
 
 static const char NO_PASSWD[] = "x";
+
+/* https://stackoverflow.com/questions/2351087/what-is-the-best-32bit-hash-function-for-short-strings-tag-names# */
+/* modified to output in the range of 10000 - 2147483647 */
+/* name_hash: compute hash value of string */
+unsigned int name_hash(const char *str)
+{
+   unsigned int h;
+   unsigned char *p;
+   /* Empirically, the values 31 and 37 have proven to be good choices for the
+      multiplier in a hash function for ASCII strings. */
+   unsigned int MULTIPLIER=37;
+
+   h = 0;
+   for (p = (unsigned char*)str; *p != '\0'; p++)
+      h = MULTIPLIER * h + *p;
+
+   /* Enforce high range of 2147483647 */
+   h &= 0x7fffffff;
+   
+   /* Enforce low range of 10000 */
+   if (h < 10000)
+      h += 10000;
+   
+   return h;
+}
 
 /**
  * Safely convert a base-10 string into an unsigned long. This function
@@ -102,12 +158,16 @@ static int8_t _safe_convert_ulong(const char *str, unsigned long *out)
 
 /**
  * Parses the configuration for this module. The format is simple:
- *   server <ip[:port]>[,ip[:port]]...[ip[:port]]
- *   secret <secret>              (used by all servers)
- *   timeout <seconds>            (used by all servers)
- *   service <TACACS+ service>    (defaults to linuxlogin)
- *   protocol <TACACS+ protocol>  (defaults to ssh)
- *   debug-level <int>            (currently unused)
+ *   server <ip[:port]> secret <secret>        (can have multiple server lines)
+ *   timeout <seconds>                         (used by all servers)
+ *   service <TACACS+ service>                 (defaults to linuxlogin)
+ *   protocol <TACACS+ protocol>               (defaults to ssh)
+ *   default-hashed-uid <yes/no>               (defaults to no (UID from TACACS+))
+ *   default-home <home prefix>                (defaults to HOME from TACACS+. Ex: /home)
+ *   default-shell <shell>                     (defaults to SHELL from TACACS+. Ex: /bin/sh)
+ *   mapped-group <remote group> <local group> (maps remote to local group)
+ *   mapped-shell <remote group> <shell>       (maps remote group to shell)
+ *   debug-level <int>                         (currently unused)
  *
  * \param[in] buffer a buffer than can be used to store string values
  * \param[in] buflen the length of the `buffer'
@@ -154,7 +214,6 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
     {
         char *key = NULL;
         char *val = NULL;
-        char *endval = NULL;
         size_t len = 0;
 
         // ignore empty lines and comments
@@ -193,82 +252,120 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
             --len;
         }
         val[++len] = '\0';
-        endval = (val + len);
 
         if (0 == strncmp(key, CONFKEY_SERVER, sizeof(CONFKEY_SERVER)))
         {
             int rv = -1;
             char *srv = val;
+            char *secret = NULL;
             struct addrinfo hints;
 
             memset(&hints, 0, sizeof(hints));
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
 
-            while (endval > val)
-            {
-                struct addrinfo *servers = NULL;
-                char *port = NULL;
+            struct addrinfo *server = NULL;
+            char *port = NULL;
 
-                while ('\0' != *srv && ',' != *srv && ':' != *srv)
+            // parse server and optional port
+            while ('\0' != *srv && !isspace(*srv) && ':' != *srv)
+            {
+                ++srv;
+            }
+            if (':' == *srv)
+            {
+                *srv = '\0';
+                port = ++srv;
+                while ('\0' != *srv && !isspace(*srv))
                 {
                     ++srv;
                 }
-                if (':' == *srv)
+            }
+            *srv = '\0';
+
+            // get ready to parse the next part of line (ex: secret)
+            key = ++srv;
+
+            // save server
+            srv = val;
+
+            // reset val to key
+            val = key;
+
+            // find "secret" keyword
+            while ('\0' != *val && !isspace(*val))
+            {
+                ++val;
+            }
+
+            // null terminate keyword
+            *(val++) = '\0';
+
+            // no "secret" keyword or no secret value? log it, but continue
+            if (0 != strncmp(key, CONFKEY_SECRET, sizeof(CONFKEY_SECRET)) ||
+                '\0' == *val)
+            {
+                syslog(LOG_WARNING, "%s: server=`%s' is missing a secret",
+                       __FILE__, srv);
+            }
+            else
+            {
+                // secret keyword and value found
+
+                // move past remaining whitespace
+                while (isspace(*val))
                 {
-                    *srv = '\0';
-                    port = ++srv;
-                    while ('\0' != *srv && ',' != *srv)
-                    {
-                        ++srv;
-                    }
+                    ++val;
                 }
 
-                *srv = '\0';
-
-                if (0 == (rv = getaddrinfo(val, port ? port : "49", &hints,
-                                           &servers)))
+                // rest of line is the secret value
+                if (bufleft < strlen(val) + 1)
                 {
-                    assert(NULL != servers);
-
-                    if (NULL == G_tacplus_conf.lastsrv)
-                    {
-                        assert(NULL == G_tacplus_conf.servers);
-                        G_tacplus_conf.lastsrv =
-                            G_tacplus_conf.servers = servers;
-                    }
-                    else
-                    {
-                        assert(NULL != G_tacplus_conf.servers);
-                        G_tacplus_conf.lastsrv->ai_next = servers;
-                    }
-
-                    // iterate our linked-list to the end
-                    while (NULL != G_tacplus_conf.lastsrv->ai_next)
-                    {
-                        G_tacplus_conf.lastsrv =
-                            G_tacplus_conf.lastsrv->ai_next;
-                    }
+                    errno = ERANGE;
+                    status = NSS_STATUS_TRYAGAIN;
+                    break;
                 }
 
-                val = ++srv;
-            }
-        }
-        else if (0 == strncmp(key, CONFKEY_SECRET, sizeof(CONFKEY_SECRET)))
-        {
-            if (bufleft < strlen(val) + 1)
-            {
-                errno = ERANGE;
-                status = NSS_STATUS_TRYAGAIN;
-                break;
+                secret = offset;
+                while ('\0' != *val)
+                {
+                    *offset++ = *val++;
+                }
+                // null terminate offset
+                *offset = '\0';
+                bufleft = buflen - (++offset - buffer);
             }
 
-            G_tacplus_conf.secret = offset;
-            while ('\0' != *val)
+            if (0 == (rv = getaddrinfo(srv, port ? port : "49", &hints,
+                                       &server)))
             {
-                *offset++ = *val++;
+                assert(NULL != server);
+
+                // allocate new entry
+                struct tacplus_server_st *ts = (struct tacplus_server_st*)
+                    malloc(sizeof(struct tacplus_server_st));
+                assert(NULL != ts);
+                ts->server = server;
+                ts->secret = secret;
+                ts->next = NULL;
+
+                if (NULL == G_tacplus_conf.lastsrv)
+                {
+                    assert(NULL == G_tacplus_conf.servers);
+                    G_tacplus_conf.lastsrv = G_tacplus_conf.servers = ts;
+                }
+                else
+                {
+                    assert(NULL != G_tacplus_conf.servers);
+                    G_tacplus_conf.lastsrv->next = ts;
+                }
+
+                // iterate our linked-list to the end
+                while (NULL != G_tacplus_conf.lastsrv->next)
+                {
+                    G_tacplus_conf.lastsrv = G_tacplus_conf.lastsrv->next;
+                }
             }
-            bufleft = buflen - (++offset - buffer);
         }
         else if (0 == strncmp(key, CONFKEY_TIMEOUT, sizeof(CONFKEY_TIMEOUT)))
         {
@@ -324,6 +421,195 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
                 *offset++ = *val++;
             }
             bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_DEF_UID, sizeof(CONFKEY_DEF_UID)))
+        {
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            G_tacplus_conf.default_hashed_uid = offset;
+            while ('\0' != *val)
+            {
+                *offset++ = *val++;
+            }
+            bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_DEF_HOME, sizeof(CONFKEY_DEF_HOME)))
+        {
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            G_tacplus_conf.default_home = offset;
+            while ('\0' != *val)
+            {
+                *offset++ = *val++;
+            }
+            bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_DEF_SHELL,
+                              sizeof(CONFKEY_DEF_SHELL)))
+        {
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            G_tacplus_conf.default_shell = offset;
+            while ('\0' != *val)
+            {
+                *offset++ = *val++;
+            }
+            bufleft = buflen - (++offset - buffer);
+        }
+        else if (0 == strncmp(key, CONFKEY_MAPPED_GROUP, sizeof(CONFKEY_MAPPED_GROUP)))
+        {
+            char *remote_group = NULL;
+            char *local_group = NULL;
+
+            // parse remote group
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            remote_group = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // move past remaining whitespace
+            while (isspace(*val))
+            {
+                ++val;
+            }
+
+            // parse local group
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            local_group = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // allocate new entry
+            struct tacplus_group_map_st *ts = (struct tacplus_group_map_st*)
+                malloc(sizeof(struct tacplus_group_map_st));
+            assert(NULL != ts);
+            ts->remote_group = remote_group;
+            ts->local_group = local_group;
+            ts->next = NULL;
+
+            if (NULL == G_tacplus_conf.last_group_map)
+            {
+                assert(NULL == G_tacplus_conf.group_map);
+                G_tacplus_conf.last_group_map = G_tacplus_conf.group_map = ts;
+            }
+            else
+            {
+                assert(NULL != G_tacplus_conf.group_map);
+                G_tacplus_conf.last_group_map->next = ts;
+            }
+
+            // iterate our linked-list to the end
+            while (NULL != G_tacplus_conf.last_group_map->next)
+            {
+                G_tacplus_conf.last_group_map = G_tacplus_conf.last_group_map->next;
+            }
+        }
+        else if (0 == strncmp(key, CONFKEY_MAPPED_SHELL, sizeof(CONFKEY_MAPPED_SHELL)))
+        {
+            char *remote_group = NULL;
+            char *shell = NULL;
+
+            // parse remote group
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            remote_group = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // move past remaining whitespace
+            while (isspace(*val))
+            {
+                ++val;
+            }
+
+            // parse shell
+            if (bufleft < strlen(val) + 1)
+            {
+                errno = ERANGE;
+                status = NSS_STATUS_TRYAGAIN;
+                break;
+            }
+
+            shell = offset;
+            while ('\0' != *val && !isspace(*val))
+            {
+                *offset++ = *val++;
+            }
+            // null terminate offset
+            *offset = '\0';
+            bufleft = buflen - (++offset - buffer);
+
+            // allocate new entry
+            struct tacplus_shell_map_st *ts = (struct tacplus_shell_map_st*)
+                malloc(sizeof(struct tacplus_shell_map_st));
+            assert(NULL != ts);
+            ts->remote_group = remote_group;
+            ts->shell = shell;
+            ts->next = NULL;
+
+            if (NULL == G_tacplus_conf.last_shell_map)
+            {
+                assert(NULL == G_tacplus_conf.shell_map);
+                G_tacplus_conf.last_shell_map = G_tacplus_conf.shell_map = ts;
+            }
+            else
+            {
+                assert(NULL != G_tacplus_conf.shell_map);
+                G_tacplus_conf.last_shell_map->next = ts;
+            }
+
+            // iterate our linked-list to the end
+            while (NULL != G_tacplus_conf.last_shell_map->next)
+            {
+                G_tacplus_conf.last_shell_map = G_tacplus_conf.last_shell_map->next;
+            }
         }
         else
         {
@@ -424,6 +710,7 @@ static const char TAC_ATTR_UID[] = "UID";
 static const char TAC_ATTR_GID[] = "GID";
 static const char TAC_ATTR_HOME[] = "HOME";
 static const char TAC_ATTR_SHELL[] = "SHELL";
+static const char TAC_ATTR_GROUP[] = "GROUP";
 
 static const char *REQUIRED_TAC_ATTRS[] =
     {
@@ -447,6 +734,10 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
     char *offset = buffer;
     const char *attr_good[REQUIRED_TAC_ATTRS_LEN] = { 0 };
     ptrdiff_t bufleft = buflen - (offset - buffer);
+    char *group = NULL;
+    char *shell = NULL;
+    struct tacplus_group_map_st *group_map_entry = NULL;
+    struct tacplus_shell_map_st *shell_map_entry = NULL;
 
 #define mark_attr_good(attrptr)                          \
     for (size_t i = 0; i < REQUIRED_TAC_ATTRS_LEN; ++i)  \
@@ -461,6 +752,19 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
             break;                                       \
         }                                                \
     }
+
+#define is_attr_good(attrptr)                            \
+({                                                       \
+    bool is_good = false;                                \
+    for (size_t i = 0; i < REQUIRED_TAC_ATTRS_LEN; ++i)  \
+    {                                                    \
+        if ((attrptr) == attr_good[i])                   \
+        {                                                \
+            is_good = true;                              \
+        }                                                \
+    }                                                    \
+    is_good;                                             \
+})
 
     // nullify the attr_good variable
     memset(attr_good, 0, sizeof(attr_good));
@@ -555,13 +859,81 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
                     goto buffer_full;
                 }
 
-                pw->pw_shell = offset;
+                if (!is_attr_good(TAC_ATTR_SHELL))
+                {
+                    // If shell was not set via a mapped group, process it
+                    pw->pw_shell = offset;
+                    mark_attr_good(TAC_ATTR_SHELL);
+                }
+
                 while ('\0' != *value)
                 {
                     *offset++ = *value++;
                 }
                 bufleft = buflen - (++offset - buffer);
-                mark_attr_good(TAC_ATTR_SHELL);
+            }
+            if (0 == strcmp(tmp, TAC_ATTR_GROUP))
+            {
+                if (bufleft < strlen(value) + 1)
+                {
+                    goto buffer_full;
+                }
+
+                group = offset;
+                while ('\0' != *value)
+                {
+                    *offset++ = *value++;
+                }
+                bufleft = buflen - (++offset - buffer);
+
+                // Iterate through our mapped group list
+                for (group_map_entry = G_tacplus_conf.group_map;
+                     NULL != group_map_entry;
+                     group_map_entry = group_map_entry->next)
+                {
+                    if (0 == strcmp(group_map_entry->remote_group, group))
+                    {
+                        // Now find the mapped shell
+                        // Iterate through our mapped shell list
+                        for (shell_map_entry = G_tacplus_conf.shell_map;
+                             NULL != shell_map_entry;
+                             shell_map_entry = shell_map_entry->next)
+                        {
+                            if (0 == strcmp(shell_map_entry->remote_group, group))
+                            {
+                                // Found group in map, substitute mapped group name
+                                shell = shell_map_entry->shell;
+                                break;
+                            }
+                        }
+
+                        // Found group in map, substitute mapped group name
+                        group = group_map_entry->local_group;
+                        syslog(LOG_WARNING, "%s: mapped group: %s, mapped shell: %s", __FILE__, group, shell);
+                        break;
+                    }
+                }
+
+                // Map group name to gid
+                errno = 0;
+                struct group *grp = getgrnam(group);
+                if (grp)
+                {
+                    pw->pw_gid = grp->gr_gid;
+                    mark_attr_good(TAC_ATTR_GID);
+
+                    // Now that gid is good, check if a shell was mapped
+                    if (NULL != shell)
+                    {
+                        pw->pw_shell = shell;
+                        mark_attr_good(TAC_ATTR_SHELL);
+                    }
+                }
+                else
+                {
+                    *errnop = errno;
+                    status = NSS_STATUS_TRYAGAIN;
+                }
             }
         }
         else
@@ -590,9 +962,30 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
 
         if (!seen)
         {
-            syslog(LOG_WARNING, "%s: missing required attribute '%s'",
-                   __FILE__, cur);
-            status = NSS_STATUS_NOTFOUND;
+            if ((0 == strcmp(cur, TAC_ATTR_UID)) &&
+                (0 == strcmp(G_tacplus_conf.default_hashed_uid, "yes")))
+            {
+                pw->pw_uid = name_hash(pw->pw_name);
+            }
+            else if ((0 == strcmp(cur, TAC_ATTR_HOME)) &&
+                     (NULL != G_tacplus_conf.default_home))
+            {
+                char *dir = (char*) malloc(sizeof(char)*80);
+                assert(NULL != dir);
+                sprintf(dir, "%s/%s", G_tacplus_conf.default_home, pw->pw_name);
+                pw->pw_dir = dir;
+            }
+            else if ((0 == strcmp(cur, TAC_ATTR_SHELL)) &&
+                     (NULL != G_tacplus_conf.default_shell))
+            {
+                pw->pw_shell = G_tacplus_conf.default_shell;
+            }
+            else
+            {
+                syslog(LOG_WARNING, "%s: missing required attribute '%s'",
+                       __FILE__, cur);
+                status = NSS_STATUS_NOTFOUND;
+            }
         }
     }
 
@@ -612,9 +1005,18 @@ enum nss_status _nss_tacplus_getpwnam_r(const char *name, struct passwd *pw,
 {
     enum nss_status status = NSS_STATUS_NOTFOUND;
     int tac_fd = -1;
-    struct addrinfo *server = NULL;
+    struct tacplus_server_st *server = NULL;
     time_t now = -1;
     uint32_t cycle = 0;
+
+    // If user is "*" or "%q", exit immediately, as this causes hanging on
+    // the command line with tab completion if any of the tacacs+ servers
+    // are down.  "*" is seen for normal bash tab competion and "%q" is
+    // seen when "~" (home dir shortcut) is part of the tab completion.
+    if ((0 == strcmp(name, "*")) || (0 == strcmp(name, "%q")))
+    {
+        return status;
+    }
 
     (void)pthread_once(&G_tacplus_initialized, &_initalize_tacplus);
     now = time(NULL);
@@ -650,28 +1052,31 @@ enum nss_status _nss_tacplus_getpwnam_r(const char *name, struct passwd *pw,
     // not on server.
     for (server = G_tacplus_conf.servers;
          NSS_STATUS_NOTFOUND == status && NULL != server;
-         server = server->ai_next)
+         server = server->next)
     {
         void *sin_addr = NULL;
 
         // the first member of sockaddr_in and sockaddr_in6 are the same, so
         // this should always work.
-        uint16_t port = ntohs(((struct sockaddr_in *)server->ai_addr)->sin_port);
+        uint16_t port = ntohs(((struct sockaddr_in *)
+                               server->server->ai_addr)->sin_port);
 
         // this is ugly, but we need to differentiate IPv6 vs. IPv4 addresses
         // (in practice, this may not be necessary, as I'm not certain if the
         // remainder of this code is capable of handling IPv6, yet.)
-        sin_addr = (  AF_INET6 == server->ai_family
-                    ? (void*)&((struct sockaddr_in6 *)server->ai_addr)->sin6_addr
-                    : (void*)&((struct sockaddr_in *)server->ai_addr)->sin_addr);
-        inet_ntop(server->ai_family, sin_addr, buffer, buflen);
+        sin_addr = (  AF_INET6 == server->server->ai_family
+                    ? (void*)&((struct sockaddr_in6 *)
+                               server->server->ai_addr)->sin6_addr
+                    : (void*)&((struct sockaddr_in *)
+                               server->server->ai_addr)->sin_addr);
+        inet_ntop(server->server->ai_family, sin_addr, buffer, buflen);
 
         syslog(LOG_INFO, "%s: begin lookup: user=`%s', server=`%s:%d'",
                __FILE__, name, buffer, port);
 
         // connect to the current server
         errno = 0;
-        tac_fd = tac_connect_single(server, G_tacplus_conf.secret, NULL, 15);
+        tac_fd = tac_connect_single(server->server, server->secret, NULL, 15);
 
         if (0 > tac_fd)
         {
