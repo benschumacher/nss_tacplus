@@ -30,3 +30,14 @@
 
 # Debug files
 *.dSYM/
+
+# Build directories
+build/
+bin/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
