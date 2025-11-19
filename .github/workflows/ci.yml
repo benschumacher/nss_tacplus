@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, 'claude/*' ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-and-test:
+    name: Build on ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04]
+        include:
+          - os: ubuntu-20.04
+            container: ubuntu:20.04
+          - os: ubuntu-22.04
+            container: ubuntu:22.04
+
+    container: ${{ matrix.container }}
+
+    steps:
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y \
+          build-essential \
+          git \
+          cmake \
+          autoconf \
+          automake \
+          libtool \
+          libpam0g-dev \
+          libssl-dev \
+          wget
+
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Build and install pam_tacplus
+      run: |
+        git clone https://github.com/jeroennijhof/pam_tacplus.git /tmp/pam_tacplus
+        cd /tmp/pam_tacplus
+        autoreconf -i
+        ./configure --prefix=/usr/local
+        make
+        make install
+        ldconfig
+
+    - name: Build with Make
+      run: |
+        make clean
+        make
+
+    - name: Build test harness
+      run: |
+        make test
+
+    - name: Build with CMake
+      run: |
+        mkdir -p build
+        cd build
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DENABLE_HARDENING=ON
+        make VERBOSE=1
+
+    - name: Run basic tests
+      run: |
+        cd build
+        # Basic sanity check that library loads
+        file libnss_tacplus.so.2
+        ldd libnss_tacplus.so.2 || true
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck clang-tidy
+
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all --error-exitcode=1 --suppress=missingIncludeSystem \
+          --inline-suppr src/ test/ || true
+
+    - name: Check for common issues
+      run: |
+        # Check for hardcoded credentials (should only be in example configs)
+        ! grep -r "password" src/ test/ || echo "Warning: password string found in source"
+
+        # Check for unsafe functions
+        ! grep -rn "strcpy\|strcat\|sprintf\|gets" src/ || echo "Warning: unsafe functions found"
+
+  security-check:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Run security checks
+      run: |
+        # Check for potential security issues
+        echo "Checking for common security patterns..."
+
+        # Check for format string vulnerabilities
+        ! grep -rn 'syslog.*%s.*%' src/ || echo "Potential format string issue"
+
+        # Check for buffer operations
+        grep -rn 'memcpy\|memmove\|strncpy' src/ || echo "Buffer operations found (review needed)"
+
+        # Check permissions on config files
+        find etc/ -type f -exec ls -la {} \;

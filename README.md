@@ -1,6 +1,35 @@
 # TACACS+ module for Name Service Switch (NSS)
 
-## Building libnss_tacplus.so.2
+> **🚀 Modernization Update**: This repository has been modernized with critical security fixes,
+> modern build system (CMake), and CI/CD pipeline. See [CHANGELOG.md](CHANGELOG.md) for details
+> and [SECURITY.md](SECURITY.md) for security information.
+
+[![CI](https://github.com/benschumacher/nss_tacplus/actions/workflows/ci.yml/badge.svg)](https://github.com/benschumacher/nss_tacplus/actions/workflows/ci.yml)
+
+## Quick Start
+
+### Option 1: CMake (Recommended)
+
+```bash
+# Install dependencies (Ubuntu/Debian)
+sudo apt-get install build-essential cmake libpam0g-dev git
+
+# Build and install pam_tacplus dependency
+git clone https://github.com/jeroennijhof/pam_tacplus.git
+cd pam_tacplus
+autoreconf -i && ./configure && make && sudo make install
+cd ..
+
+# Build nss_tacplus with CMake
+git clone https://github.com/benschumacher/nss_tacplus.git
+cd nss_tacplus
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_HARDENING=ON
+make
+sudo make install
+```
+
+### Option 2: Traditional Make
 
 To build it:
 
