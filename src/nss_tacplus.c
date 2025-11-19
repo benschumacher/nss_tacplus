@@ -25,6 +25,7 @@
 
 #define TACPLUS_CONF_FILE "/etc/tacplus.conf"
 #define CONFIG_BUFSZ 1024
+#define MAX_ATTR_NAME_LEN 256
 
 static pthread_once_t G_tacplus_initialized = PTHREAD_ONCE_INIT;
 static time_t G_tacplus_started = -1;
@@ -339,6 +340,7 @@ static enum nss_status _parse_config(char *buffer, size_t buflen)
 static void _check_config(int cycle)
 {
     struct stat conf_stat;
+    enum nss_status status = NSS_STATUS_SUCCESS;
 
     memset(&conf_stat, 0, sizeof(conf_stat));
     if (   0 != stat(TACPLUS_CONF_FILE, &conf_stat)
@@ -355,7 +357,33 @@ static void _check_config(int cycle)
     syslog(LOG_INFO, "%s: `%s' detected configuration change at cycle=%d",
            __FILE__, TACPLUS_CONF_FILE, cycle);
 
-    // reload our configuration!
+    // Free old server list to prevent memory leak
+    if (NULL != G_tacplus_conf.servers)
+    {
+        freeaddrinfo(G_tacplus_conf.servers);
+        G_tacplus_conf.servers = NULL;
+        G_tacplus_conf.lastsrv = NULL;
+    }
+
+    // Clear old configuration
+    memset(&G_tacplus_conf, 0, sizeof(G_tacplus_conf));
+    memset(&G_tacplus_confbuf, 0, sizeof(G_tacplus_confbuf));
+
+    // Reload configuration
+    status = _parse_config(G_tacplus_confbuf, sizeof(G_tacplus_confbuf));
+    G_tacplus_conf.status = status;
+    G_tacplus_conf.errnum = errno;
+
+    if (NSS_STATUS_SUCCESS != status)
+    {
+        syslog(LOG_ERR, "%s: configuration reload failed at cycle=%d",
+               __FILE__, cycle);
+    }
+    else
+    {
+        syslog(LOG_INFO, "%s: configuration reloaded successfully at cycle=%d",
+               __FILE__, cycle);
+    }
 }
 
 /**
@@ -414,7 +442,10 @@ static void _normalize_name(const char *name, size_t namelen,
         {
             obuf[i] = '_';
         }
-        obuf[i] = toupper(name[i]);
+        else
+        {
+            obuf[i] = toupper(name[i]);
+        }
     }
 
     obuf[i] = '\0';
@@ -497,9 +528,19 @@ static int _passwd_from_reply(const struct areply *reply, const char *name,
         }
         if (NULL != sep)
         {
-            char tmp[attr->attr_len]; // non-portable, but works for GCC
+            char tmp[MAX_ATTR_NAME_LEN];
             char *value = (sep + 1);  // value starts after seperator
             size_t namsz = sep - attr->attr;
+
+            // Validate attribute name length to prevent buffer overflow
+            if (namsz >= MAX_ATTR_NAME_LEN)
+            {
+                syslog(LOG_WARNING,
+                       "%s: attribute name too long (%zu bytes), skipping",
+                       __FILE__, namsz);
+                attr = attr->next;
+                continue;
+            }
 
             memset(tmp, '\0', sizeof(tmp));
 
